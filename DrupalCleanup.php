@@ -57,7 +57,7 @@ class DrupalCleanup implements PluginInterface, EventSubscriberInterface {
   public static function getSubscribedEvents(): array {
     return [
       PackageEvents::POST_PACKAGE_INSTALL => 'onPostPackageInstall',
-      PackageEvents::POST_PACKAGE_UPDATE  => 'onPostPackageUpdate',
+      PackageEvents::POST_PACKAGE_UPDATE => 'onPostPackageUpdate',
     ];
   }
 
@@ -71,7 +71,172 @@ class DrupalCleanup implements PluginInterface, EventSubscriberInterface {
       $this->io->write('Clean-up is skipped', TRUE, IOInterface::VERBOSE);
       return [];
     }
+
     $this->cleanPackage($event->getOperation()->getPackage());
+  }
+
+  /**
+   * Clean a single package.
+   *
+   * This applies in the context of a package post-install or post-update event.
+   *
+   * @param \Composer\Package\PackageInterface $package
+   *   The package to clean.
+   */
+  public function cleanPackage(PackageInterface $package) {
+    $package_type = $package->getType();
+
+    if (!$this->isPackageTypeShouldBeCleared($package_type)) {
+      return;
+    }
+
+    $rules = $this->getPackageCleanRules($package_type);
+
+    if (count($rules) === 0) {
+      $this->printMessage(
+        $package,
+        "skipped as settings for package type <comment>$package_type</comment> missing",
+      );
+
+      return;
+    }
+
+    $removed = 0;
+    $package_path = $this
+      ->composer
+      ->getInstallationManager()
+      ->getInstallPath($package);
+    $fs = new Filesystem();
+
+    foreach ($rules as $rule) {
+      $paths = glob($package_path . DIRECTORY_SEPARATOR . $rule, GLOB_ERR);
+
+      if (!$paths) {
+        continue;
+      }
+
+      foreach ($paths as $path) {
+        try {
+          $fs->remove($path);
+          $removed++;
+        }
+        catch (\Throwable $e) {
+          $this->io->writeError(\sprintf(
+            '<info>%s:</info> (<comment>%s</comment>) Error occurred: %s',
+            $package->getName(),
+            $package_type,
+            $e->getMessage()
+          ));
+        }
+      }
+    }
+
+    $this->printMessage($package, "removed <comment>$removed</comment>");
+  }
+
+  /**
+   * Checks is current package type should be cleared.
+   *
+   * @param string $package_type
+   *   The package type.
+   *
+   * @return bool
+   *   TRUE if package type is listed and needs to be processed, FALSE
+   *   otherwise.
+   */
+  private function isPackageTypeShouldBeCleared(string $package_type): bool {
+    $extra = $this->composer->getPackage()->getExtra();
+
+    foreach ($this->getSuitableScopes() as $scope) {
+      if (isset($extra['drupal-cleanup'][$scope][$package_type])) {
+        return TRUE;
+      }
+    }
+
+    return FALSE;
+  }
+
+  /**
+   * Gets the list of available scopes.
+   *
+   * @return string[]
+   *   An array with scope names where search for rules:
+   *   - default: Always clean;
+   *   - dev: When composer command called without '--no-dev';
+   *   - no-dev: When composer command called with '--no-dev'.
+   */
+  private function getSuitableScopes(): array {
+    return [
+      'default',
+      $this->isDevMode() ? 'dev' : 'no-dev',
+    ];
+  }
+
+  /**
+   * Checks whether composer install packages in dev mode or not.
+   *
+   * @return bool
+   *   TRUE if comman run with dev mode, FALSE if running with '--no-dev'
+   *   option.
+   */
+  private function isDevMode(): bool {
+    return getenv('COMPOSER_DEV_MODE') === '1';
+  }
+
+  /**
+   * Gets the package rules to clean up.
+   *
+   * @param string $package_type
+   *   The package type.
+   *
+   * @return array
+   *   An array of paths to clean up.
+   */
+  private function getPackageCleanRules(string $package_type): array {
+    $extra = $this->composer->getPackage()->getExtra();
+    $rules = [];
+
+    foreach ($this->getSuitableScopes() as $scope) {
+      if (!isset($extra['drupal-cleanup'][$scope][$package_type])) {
+        continue;
+      }
+
+      $rules = \array_merge(
+        $rules,
+        $extra['drupal-cleanup'][$scope][$package_type],
+      );
+    }
+
+    return \array_diff($rules, $this->getExcludeRules());
+  }
+
+  /**
+   * Gets rules with exclude paths.
+   *
+   * @return array
+   *   An array of paths that should be preserved.
+   */
+  private function getExcludeRules(): array {
+    $extra = $this->composer->getPackage()->getExtra();
+
+    return $extra['drupal-cleanup']['exclude'] ?? [];
+  }
+
+  /**
+   * Prints a message into terminal.
+   *
+   * @param \Composer\Package\PackageInterface $package
+   *   The processed package.
+   * @param string $message
+   *   The message.
+   */
+  private function printMessage(PackageInterface $package, string $message): void {
+    $this->io->write(sprintf(
+      '  - Cleaning <info>%s</info> (<comment>%s</comment>): %s',
+      $package->getName(),
+      $package->getType(),
+      $message
+    ), TRUE, IOInterface::VERBOSE);
   }
 
   /**
@@ -84,57 +249,8 @@ class DrupalCleanup implements PluginInterface, EventSubscriberInterface {
       $this->io->write('Clean-up is skipped', TRUE, IOInterface::VERBOSE);
       return [];
     }
-    $this->cleanPackage($event->getOperation()->getTargetPackage());
-  }
 
-  /**
-   * Clean a single package.
-   *
-   * This applies in the context of a package post-install or post-update event.
-   *
-   * @param \Composer\Package\PackageInterface $package
-   *   The package to clean.
-   */
-  public function cleanPackage(PackageInterface $package) {
-    $extra = $this->composer->getPackage()->getExtra();
-    $type = $package->getType();
-    if (isset($extra['drupal-cleanup'][$type])) {
-      $removed = 0;
-      $rules = $extra['drupal-cleanup'][$type];
-      $package_path = $this->composer->getInstallationManager()
-        ->getInstallPath($package);
-      $fs = new Filesystem();
-      $exclude = $extra['drupal-cleanup']['exclude'] ?? [];
-      foreach ($rules as $rule) {
-        $paths = glob($package_path . DIRECTORY_SEPARATOR . $rule, GLOB_ERR);
-        if (is_array($paths)) {
-          foreach ($paths as $path) {
-            if (!in_array($path, $exclude)) {
-              try {
-                $fs->remove($path);
-                $removed++;
-              }
-              catch (\Throwable $e) {
-                $this->io->writeError(\sprintf(
-                  '<info>%s:</info> (<comment>%s</comment>) Error occurred: %s',
-                  $package->getName(), $type,
-                  $e->getMessage()
-                ));
-              }
-            }
-          }
-        }
-      }
-      $message = "removed <comment>$removed</comment>";
-    }
-    else {
-      $message = "skipped as settings for package type <comment>$type</comment> missing";
-    }
-    $this->io->write(sprintf(
-      '  - Cleaning <info>%s</info> (<comment>%s</comment>): %s',
-      $package->getName(),
-      $type, $message
-    ), TRUE, IOInterface::VERBOSE);
+    $this->cleanPackage($event->getOperation()->getTargetPackage());
   }
 
 }
